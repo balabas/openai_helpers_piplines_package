@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openai-helpers-piplines-package"
+version = "0.1.0"
+description = "Reusable OpenAI helper pipelines and dynamic Pydantic schema utilities."
+requires-python = ">=3.12"
+dependencies = [
+  "openai>=1.0",
+  "pydantic>=2.0",
+]
+
+[tool.setuptools]
+py-modules = ["openai_helpers_piplines_package"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["helpers*", "pipelines*"]

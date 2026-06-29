@@ -4,7 +4,15 @@ This module lives at the repository root so ``import openai_helpers_piplines_pac
 resolves here when the notebook is run from this folder.
 """
 from helpers.pydantic_helper import dict_to_pydantic_schema
-from pipelines.chat import with_pipelines
+from pipelines.chat import (
+    EmptyAssistantOutputError,
+    PipelineDebugStage,
+    PipelineRequestError,
+    StructuredOutputRepairExhaustedError,
+    ToolIterationLimitExceededError,
+    classify_pipeline_error,
+    with_pipelines,
+)
 from pipelines.json_fix import JsonFixPipeline
 from pipelines.logger import LoggerPipeline
 from pipelines.loop_guard import LoopGuardPipeline
@@ -13,6 +21,12 @@ from pipelines.tool import ToolPipeline
 
 __all__ = [
     "with_pipelines",
+    "PipelineRequestError",
+    "PipelineDebugStage",
+    "EmptyAssistantOutputError",
+    "StructuredOutputRepairExhaustedError",
+    "ToolIterationLimitExceededError",
+    "classify_pipeline_error",
     "chat_session",
     "JsonFixPipeline",
     "LoggerPipeline",

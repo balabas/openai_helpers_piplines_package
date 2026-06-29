@@ -10,9 +10,9 @@ openai_helpers_piplines_package.egg-info/requires.txt
 openai_helpers_piplines_package.egg-info/top_level.txt
 pipelines/__init__.py
 pipelines/chat.py
-pipelines/combined.py
 pipelines/json_fix.py
 pipelines/logger.py
 pipelines/loop_guard.py
 pipelines/session.py
 pipelines/tool.py
+tests/test_pipeline_exceptions.py

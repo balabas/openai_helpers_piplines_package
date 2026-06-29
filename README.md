@@ -20,6 +20,7 @@ from openai_helpers_piplines_package import (
     JsonFixPipeline,
     LoggerPipeline,
     LoopGuardPipeline,
+    PipelineRequestError,
     ToolPipeline,
     chat_session,
     with_pipelines,
@@ -40,7 +41,13 @@ chat = with_pipelines(
     ],
 )
 
-result = await chat.create(
+async def attempt(coro):
+    try:
+        return await coro
+    except PipelineRequestError as error:
+        return error
+
+result = await attempt(chat.create(
     model="your-model",
     messages=[
         {"role": "user", "content": "Use tools if needed and return JSON."},
@@ -54,11 +61,14 @@ result = await chat.create(
     tool_sources=[{"add": add}, mcp_search_client],
     schema_dict={"answer": str, "sources": [str]},
     return_trace=True,
-)
+))
 
-print(result.response)
-print(result.parsed)
-print(result.trace)
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.response)
+    print(result.parsed)
+    print(result.trace)
 ````
 
 `with_pipelines(...)` returns `PipelinedChatCompletions`, which exposes an async `create(...)` method.
@@ -182,13 +192,18 @@ LoggerPipeline(path="pipeline.log")
 Per-call inputs belong to `create(...)`:
 
 ````python
-result = await chat.create(
+result = await attempt(chat.create(
     model=model,
     messages=messages,
     tool_sources=[{"add": add}, mcp_client],
     schema_dict={"answer": str},
     return_trace=True,
-)
+))
+
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.parsed)
 ````
 
 `schema_dict` is optional. If it is passed, `JsonFixPipeline` must be present in `layers`.
@@ -262,22 +277,54 @@ result.tool_executions # executed tool calls
 
 Pipeline failures raise informative exceptions that carry the request context - the params, the full message history, and the provider's own error text - instead of a deep SDK traceback. In Jupyter only the message is shown; the redundant internal frames are suppressed.
 
-The main request-failure type is `PipelineRequestError` from `pipelines.chat`.
+The main request-failure type is `PipelineRequestError`. For application branching, use the package-defined names on `PipelineRequestError` plus `classify_pipeline_error(...)` instead of hard-coded strings.
+
+Direct expected pipeline errors are raised as named exception classes:
 
 ````python
-from pipelines.chat import PipelineRequestError
-
-try:
-    result = await chat.create(messages=msgs, schema_dict=schema)
-except PipelineRequestError as err:
-    ...   # request/template rejected -> inspect err.params / err.messages / err.original
+EmptyAssistantOutputError             # ValueError subclass
+StructuredOutputRepairExhaustedError  # ValueError subclass, has .attempts
+ToolIterationLimitExceededError       # RuntimeError subclass, has .limit
+PipelineRequestError                  # provider/transport wrapper, has .error_kind
 ````
 
-Structured output repair is intentionally graceful: if heuristic parsing and repair exhaust their retries, the wrapper falls back to a constructed model value rather than raising a dedicated structured-output exception. The public `StructuredOutputError` class remains importable for compatibility, but the normal flow uses `result.parsed`.
+````python
+from openai_helpers_piplines_package import (
+    EmptyAssistantOutputError,
+    PipelineRequestError,
+    StructuredOutputRepairExhaustedError,
+    ToolIterationLimitExceededError,
+    classify_pipeline_error,
+)
+
+result = await attempt(chat.create(messages=msgs, schema_dict=schema))
+kind = classify_pipeline_error(result)
+if kind == PipelineRequestError.TOOL_REQUEST_FAILED:
+    ...   # inspect result.request_stage / result.params / result.messages / result.original
+elif kind == PipelineRequestError.JSON_REPAIR_REQUEST_FAILED:
+    ...
+elif kind == PipelineRequestError.CHAT_REQUEST_FAILED:
+    ...
+elif kind == PipelineRequestError.EMPTY_ASSISTANT_OUTPUT:
+    ...
+elif kind == PipelineRequestError.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED:
+    ...
+elif kind == PipelineRequestError.TOOL_ITERATION_LIMIT_EXCEEDED:
+    ...
+elif isinstance(result, BaseException):
+    raise result
+else:
+    use(result)
+
+if isinstance(result, PipelineRequestError):
+    print(result.request_stage)  # diagnostic string, for logging/debug dumps
+````
+
+Structured output repair is not silent when it runs out of retries: if heuristic parsing and repair exhaust their retries, the wrapper raises `StructuredOutputRepairExhaustedError`. The normal flow uses `result.parsed`.
 
 ### Errors as values
 
-When a failure is an expected branch in a sequence, wrap the call so the expected request errors come back as a value while everything else still raises:
+When a failure is an expected branch in a sequence, wrap the call so expected pipeline errors come back as a value while everything else still raises:
 
 ````python
 async def attempt(coro):
@@ -285,10 +332,15 @@ async def attempt(coro):
         return await coro
     except PipelineRequestError as error:
         return error
+    except (ValueError, RuntimeError) as error:
+        if classify_pipeline_error(error) is not None:
+            return error
+        raise
 
 result = await attempt(chat.create(messages=msgs, schema_dict=schema))
-if isinstance(result, PipelineRequestError):
-    ...  # inspect the failure
+kind = classify_pipeline_error(result)
+if kind is not None:
+    ...  # expected pipeline branch
 else:
     use(result.parsed)
 ````
@@ -349,13 +401,18 @@ Local tools can be passed as a dictionary:
 def add(arguments: dict[str, int]) -> dict[str, int]:
     return {"sum": arguments["a"] + arguments["b"]}
 
-result = await chat.create(
+result = await attempt(chat.create(
     model=model,
     messages=[
         {"role": "user", "content": "Use the add tool to compute 12 + 30."},
     ],
     tool_sources=[{"add": add}],
-)
+))
+
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.response)
 ````
 
 Callable tools can also use keyword arguments:
@@ -364,11 +421,16 @@ Callable tools can also use keyword arguments:
 def add(a: int, b: int) -> dict[str, int]:
     return {"sum": a + b}
 
-result = await chat.create(
+result = await attempt(chat.create(
     model=model,
     messages=messages,
     tool_sources=[{"add": add}],
-)
+))
+
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.response)
 ````
 
 MCP-like clients are supported when they expose:
@@ -381,11 +443,16 @@ await mcp_client.call_tool(name, arguments)
 Then pass the client directly:
 
 ````python
-result = await chat.create(
+result = await attempt(chat.create(
     model=model,
     messages=messages,
     tool_sources=[mcp_search_client, {"add": add}],
-)
+))
+
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.response)
 ````
 
 ## Structured Output
@@ -398,7 +465,7 @@ chat = with_pipelines(
     layers=[JsonFixPipeline(max_retries=2)],
 )
 
-result = await chat.create(
+result = await attempt(chat.create(
     model=model,
     messages=[
         {"role": "user", "content": "Return a compact JSON profile."},
@@ -408,12 +475,15 @@ result = await chat.create(
         "score": float,
         "tags": [str],
     },
-)
+))
 
-print(result.parsed)
+if isinstance(result, PipelineRequestError):
+    print(result)
+else:
+    print(result.parsed)
 ````
 
-The wrapper first tries heuristic JSON cleanup and validation. If that fails, it makes a repair call with an explicit fit prompt and a JSON-schema response format. If that still does not produce valid JSON, the wrapper falls back to a constructed model value.
+The wrapper first tries heuristic JSON cleanup and validation. If that fails, it makes a repair call with an explicit fit prompt and a JSON-schema response format. If that still does not produce valid JSON after the configured retries, the wrapper raises `ValueError`.
 
 ## Individual Helpers
 

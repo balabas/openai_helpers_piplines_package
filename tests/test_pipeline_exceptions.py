@@ -15,6 +15,9 @@ import os
 import sys
 import tempfile
 
+import httpx
+import pytest
+
 _HERE = os.path.dirname(__file__)
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)   # fake_chat
@@ -22,7 +25,6 @@ sys.path.insert(0, _ROOT)   # package root
 
 from fake_chat import (  # noqa: E402
     AsyncFakeChatCompletions,
-    FailingChatCompletions,
     FakeChatCompletions,
     FakeProviderError,
     loop_turn,
@@ -30,13 +32,19 @@ from fake_chat import (  # noqa: E402
     tool_call_turn,
 )
 from openai_helpers_piplines_package import (  # noqa: E402
+    EmptyAssistantOutputError,
     JsonFixPipeline,
     LoggerPipeline,
     LoopGuardPipeline,
+    PipelineDebugStage,
+    PipelineRequestError,
+    StructuredOutputRepairExhaustedError,
     ToolPipeline,
+    ToolIterationLimitExceededError,
+    classify_pipeline_error,
     with_pipelines,
 )
-from pipelines.chat import PipelineRequestError  # noqa: E402
+from openai import APIConnectionError, OpenAI  # noqa: E402
 
 
 def _run(coro):
@@ -46,6 +54,25 @@ def _run(coro):
 def _actions(result):
     """All ``level/action`` strings in the trace."""
     return [f"{e.level}/{e.action}" for e in (result.trace or [])]
+
+
+def _live_client_and_model():
+    if os.environ.get("OPENAI_HELPERS_LIVE_DEBUG_TESTS") != "1":
+        pytest.skip("set OPENAI_HELPERS_LIVE_DEBUG_TESTS=1 to run live debug-injection tests")
+
+    base_url = os.environ.get("OPENAI_HELPERS_BASE_URL", "http://127.0.0.1:8080/v1")
+    api_key = os.environ.get("OPENAI_API_KEY", "not-needed-for-local-server")
+    client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=30.0)
+    model = os.environ.get("OPENAI_HELPERS_MODEL")
+    if not model:
+        try:
+            models = client.models.list()
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"live model server is not available: {type(exc).__name__}: {exc}")
+        model = models.data[0].id if models.data else None
+    if not model:
+        pytest.skip("no live model available")
+    return client, model
 
 
 # --------------------------------------------------------------------------- #
@@ -126,9 +153,9 @@ def test_schema_invalid_then_retry_succeeds():
     assert len(backend.calls) == 2
 
 
-def test_schema_exhausted_falls_back_to_model_construct():
-    # Model can't produce JSON -> exhausted repair returns a graceful fallback
-    # instead of raising. The fallback preserves the original text payload.
+def test_schema_exhausted_raises_after_retries():
+    # Model can't produce JSON -> exhausted repair must now raise instead of
+    # fabricating a fallback value.
     backend = FakeChatCompletions([text_turn("still not json"), text_turn("still not json repair")])
     chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
 
@@ -140,15 +167,99 @@ def test_schema_exhausted_falls_back_to_model_construct():
             schema_dict={"x": int},
         )
 
-    result = _run(go())
-    assert result.parsed == {"x": "still not json"}
-    assert result.response["choices"][0]["message"]["content"] == "still not json repair"
-    assert len(backend.calls) == 2
+    try:
+        _run(go())
+    except StructuredOutputRepairExhaustedError as exc:
+        assert "Structured output repair exhausted" in str(exc)
+        assert exc.attempts == 1
+        assert classify_pipeline_error(exc) == PipelineRequestError.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED
+        assert len(backend.calls) == 2
+    else:
+        raise AssertionError("expected ValueError after exhausted structured-output retries")
 
 
-def test_inline_toolcall_text_with_schema_falls_back_gracefully():
-    # Inline tool-call text is treated as invalid structured output and repaired
-    # with the same graceful fallback path used for other JSON failures.
+def test_empty_assistant_output_is_classified():
+    backend = FakeChatCompletions([text_turn("")])
+    chat = with_pipelines(backend, layers=[])
+
+    async def go():
+        return await chat.create(messages=[{"role": "user", "content": "say something"}])
+
+    try:
+        _run(go())
+    except EmptyAssistantOutputError as exc:
+        assert str(exc) == "Empty assistant output"
+        assert classify_pipeline_error(exc) == PipelineRequestError.EMPTY_ASSISTANT_OUTPUT
+    else:
+        raise AssertionError("expected ValueError for empty assistant output")
+
+
+def _raise_at(stage, error, seen=None):
+    def _debug(context):
+        if context.get("debug_stage") == stage:
+            if seen is not None:
+                seen.append(context)
+            return error
+        return None
+
+    return _debug
+
+
+def test_debug_stage_can_raise_empty_assistant_output_at_package_site():
+    seen = []
+    backend = FakeChatCompletions([text_turn("")])
+    chat = with_pipelines(backend, layers=[])
+
+    async def go():
+        return await chat.create(
+            messages=[{"role": "user", "content": "x"}],
+            debug_generate_exception=_raise_at(
+                PipelineDebugStage.EMPTY_ASSISTANT_OUTPUT,
+                EmptyAssistantOutputError(),
+                seen,
+            ),
+        )
+
+    try:
+        _run(go())
+    except EmptyAssistantOutputError as exc:
+        assert classify_pipeline_error(exc) == PipelineRequestError.EMPTY_ASSISTANT_OUTPUT
+        assert len(backend.calls) == 1
+        assert seen and seen[0]["debug_stage"] == PipelineDebugStage.EMPTY_ASSISTANT_OUTPUT
+    else:
+        raise AssertionError("expected debug-generated EmptyAssistantOutputError")
+
+
+def test_debug_stage_can_raise_structured_repair_exhausted_at_package_site():
+    seen = []
+    backend = FakeChatCompletions([text_turn("not json"), text_turn("still not json")])
+    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
+
+    async def go():
+        return await chat.create(
+            messages=[{"role": "user", "content": "x"}],
+            schema_dict={"x": int},
+            debug_generate_exception=_raise_at(
+                PipelineDebugStage.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED,
+                StructuredOutputRepairExhaustedError(attempts=1),
+                seen,
+            ),
+        )
+
+    try:
+        _run(go())
+    except StructuredOutputRepairExhaustedError as exc:
+        assert exc.attempts == 1
+        assert classify_pipeline_error(exc) == PipelineRequestError.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED
+        assert len(backend.calls) == 2
+        assert seen and seen[0]["debug_stage"] == PipelineDebugStage.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED
+    else:
+        raise AssertionError("expected debug-generated StructuredOutputRepairExhaustedError")
+
+
+def test_inline_toolcall_text_with_schema_raises_after_repair_exhaustion():
+    # Inline tool-call text is treated as invalid structured output and now
+    # raises once the repair budget is exhausted.
     inline = "<tool_call> <function=add> <parameter=a> 3 </parameter> </function> </tool_call>"
     backend = FakeChatCompletions([text_turn(inline), text_turn(inline), text_turn(inline)])
     chat = with_pipelines(backend, layers=[ToolPipeline(), JsonFixPipeline(max_retries=1)])
@@ -161,10 +272,15 @@ def test_inline_toolcall_text_with_schema_falls_back_gracefully():
             schema_dict={"answer": str},
         )
 
-    result = _run(go())
-    assert result.parsed == {"answer": inline}
-    assert result.response["choices"][0]["message"]["content"] == inline
-    assert len(backend.calls) == 3
+    try:
+        _run(go())
+    except StructuredOutputRepairExhaustedError as exc:
+        assert "Structured output repair exhausted" in str(exc)
+        assert exc.attempts == 2
+        assert classify_pipeline_error(exc) == PipelineRequestError.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED
+        assert len(backend.calls) == 3
+    else:
+        raise AssertionError("expected ValueError after repair exhaustion")
 
 
 def test_schema_validation_error_is_retried():
@@ -436,10 +552,39 @@ def test_tool_iteration_safety_limit_raises_runtimeerror():
 
     try:
         _run(go())
-    except RuntimeError as exc:
+    except ToolIterationLimitExceededError as exc:
         assert "safety limit" in str(exc)
+        assert exc.limit == 20
+        assert classify_pipeline_error(exc) == PipelineRequestError.TOOL_ITERATION_LIMIT_EXCEEDED
     else:
         raise AssertionError("expected RuntimeError at tool iteration safety limit")
+
+
+def test_debug_stage_can_raise_tool_iteration_limit_at_package_site():
+    seen = []
+    backend = FakeChatCompletions([tool_call_turn("add", {"a": 1, "b": 1}) for _ in range(20)])
+    chat = with_pipelines(backend, layers=[ToolPipeline()])
+
+    async def go():
+        return await chat.create(
+            messages=[{"role": "user", "content": "loop"}],
+            tool_sources=[{"add": _add}],
+            debug_generate_exception=_raise_at(
+                PipelineDebugStage.TOOL_ITERATION_LIMIT_EXCEEDED,
+                ToolIterationLimitExceededError(limit=20),
+                seen,
+            ),
+        )
+
+    try:
+        _run(go())
+    except ToolIterationLimitExceededError as exc:
+        assert exc.limit == 20
+        assert classify_pipeline_error(exc) == PipelineRequestError.TOOL_ITERATION_LIMIT_EXCEEDED
+        assert len(backend.calls) == 20
+        assert seen and seen[0]["debug_stage"] == PipelineDebugStage.TOOL_ITERATION_LIMIT_EXCEEDED
+    else:
+        raise AssertionError("expected debug-generated ToolIterationLimitExceededError")
 
 
 # --------------------------------------------------------------------------- #
@@ -528,7 +673,7 @@ def test_request_failure_surfaces_params_messages_and_provider_text():
             }
         },
     )
-    backend = FailingChatCompletions(err)
+    backend = FakeChatCompletions([text_turn("ok")])
     chat = with_pipelines(backend, layers=[ToolPipeline()])
 
     async def go():
@@ -540,6 +685,7 @@ def test_request_failure_surfaces_params_messages_and_provider_text():
             ],
             temperature=0.1,
             tool_sources=[{"add": _add}],
+            debug_generate_exception=err,
         )
 
     try:
@@ -547,12 +693,122 @@ def test_request_failure_surfaces_params_messages_and_provider_text():
     except PipelineRequestError as exc:
         text = str(exc)
         assert "System message must be at the beginning." in text   # provider text
+        assert exc.request_stage == "tool_generation"
+        assert classify_pipeline_error(exc) == PipelineRequestError.TOOL_REQUEST_FAILED
         assert "model='demo-model'" in text                          # params shown
         assert "temperature=0.1" in text
         assert "[0] system:" in text and "[1] user:" in text         # message history shown
         assert exc.params["model"] == "demo-model"                   # programmatic access
         assert len(exc.messages) == 2
         assert exc.original is err
+    else:
+        raise AssertionError("expected PipelineRequestError")
+
+
+def test_connection_error_surfaces_underlying_transport_cause():
+    backend = FakeChatCompletions([text_turn("ok")])
+    chat = with_pipelines(backend, layers=[])
+
+    async def go():
+        return await chat.create(
+            model="demo-model",
+            messages=[{"role": "user", "content": "hi"}],
+            debug_generate_exception=APIConnectionError(
+                message="Connection error.",
+                request=httpx.Request("GET", "http://127.0.0.1:1/v1/chat/completions"),
+            ),
+        )
+
+    try:
+        _run(go())
+    except PipelineRequestError as exc:
+        text = str(exc)
+        assert "Connection error." in text
+        assert exc.request_stage == "chat_generation"
+        assert classify_pipeline_error(exc) == PipelineRequestError.CHAT_REQUEST_FAILED
+    else:
+        raise AssertionError("expected PipelineRequestError")
+
+
+def test_live_client_debug_exception_reaches_chat_request_stage():
+    client, model = _live_client_and_model()
+    chat = with_pipelines(client.chat.completions, layers=[])
+
+    async def go():
+        return await chat.create(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            debug_generate_exception=APIConnectionError(
+                message="Connection error.",
+                request=httpx.Request("GET", "http://127.0.0.1:1/v1/chat/completions"),
+            ),
+        )
+
+    try:
+        _run(go())
+    except PipelineRequestError as exc:
+        assert exc.request_stage == "chat_generation"
+        assert classify_pipeline_error(exc) == PipelineRequestError.CHAT_REQUEST_FAILED
+        assert exc.params["model"] == model
+        assert exc.messages == [{"role": "user", "content": "hi"}]
+    else:
+        raise AssertionError("expected live-client debug PipelineRequestError")
+
+
+def test_live_client_debug_exception_reaches_tool_request_stage():
+    client, model = _live_client_and_model()
+    chat = with_pipelines(client.chat.completions, layers=[ToolPipeline()])
+    err = FakeProviderError(
+        "Error code: 400",
+        body={"error": {"code": 400, "message": "live tool debug failure", "type": "invalid_request_error"}},
+    )
+
+    async def go():
+        return await chat.create(
+            model=model,
+            messages=[{"role": "user", "content": "use tool"}],
+            tool_sources=[{"add": _add}],
+            debug_generate_exception=err,
+        )
+
+    try:
+        _run(go())
+    except PipelineRequestError as exc:
+        assert exc.request_stage == "tool_generation"
+        assert classify_pipeline_error(exc) == PipelineRequestError.TOOL_REQUEST_FAILED
+        assert exc.original is err
+        assert exc.params["model"] == model
+        assert len(exc.messages) == 1
+    else:
+        raise AssertionError("expected live-client debug PipelineRequestError")
+
+
+def test_request_failure_during_json_repair_is_labelled():
+    backend = FakeChatCompletions([text_turn("not json at all")])
+    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
+
+    async def go():
+        return await chat.create(
+            model="demo-model",
+            messages=[{"role": "user", "content": "return json"}],
+            schema_dict={"x": int},
+            debug_generate_exception=lambda kwargs: (
+                FakeProviderError(
+                    "Error code: 400",
+                    body={"error": {"code": 400, "message": "repair request failed", "type": "invalid_request_error"}},
+                )
+                if kwargs.get("debug_stage") == PipelineDebugStage.JSON_REPAIR_REQUEST_FAILED
+                else None
+            ),
+        )
+
+    try:
+        _run(go())
+    except PipelineRequestError as exc:
+        assert exc.request_stage == "json_repair"
+        assert classify_pipeline_error(exc) == PipelineRequestError.JSON_REPAIR_REQUEST_FAILED
+        assert "repair request failed" in str(exc)
+        assert len(backend.calls) == 1
     else:
         raise AssertionError("expected PipelineRequestError")
 

@@ -17,7 +17,7 @@ across all calls in a session.
 
 Usage
 -----
-Constructed by the caller and passed to ``with_pipelines(layers=[...])``.
+Constructed by the caller and passed into Pipelined Chat construction.
 ``PipelinedChatCompletions.create()`` (``pipelines/chat.py``) drives the
 tool-call rounds and calls these methods (``openai_tools``,
 ``execute_tool_calls``, ``assistant_message``, ``tool_messages``) each round.

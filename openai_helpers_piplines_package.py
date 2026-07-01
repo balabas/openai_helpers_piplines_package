@@ -10,8 +10,9 @@ from pipelines.chat import (
     PipelineRequestError,
     StructuredOutputRepairExhaustedError,
     ToolIterationLimitExceededError,
+    attempt,
     classify_pipeline_error,
-    with_pipelines,
+    pipelined_chat,
 )
 from pipelines.json_fix import JsonFixPipeline
 from pipelines.logger import LoggerPipeline
@@ -20,12 +21,13 @@ from pipelines.session import chat_session
 from pipelines.tool import ToolPipeline
 
 __all__ = [
-    "with_pipelines",
+    "pipelined_chat",
     "PipelineRequestError",
     "PipelineDebugStage",
     "EmptyAssistantOutputError",
     "StructuredOutputRepairExhaustedError",
     "ToolIterationLimitExceededError",
+    "attempt",
     "classify_pipeline_error",
     "chat_session",
     "JsonFixPipeline",

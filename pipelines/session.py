@@ -1,41 +1,62 @@
-"""Stateful chat session layer built on top of pipelined chat completions."""
+"""Stateful chat session built on top of Pipelined Chat."""
 from __future__ import annotations
 
 from typing import Any
 
 from .chat import PipelinedChatCompletionResult
 
+RoleContent = dict[str, Any] | list[dict[str, Any]]
+
 
 class ChatMessages(list[dict[str, Any]]):
-    """List of chat messages with an explicit role-content shorthand helper."""
+    """List of chat messages with role_content helpers."""
 
-    def append_role_content(self, role_content: dict[str, Any]) -> None:
-        """Append one or more ``{"role": "content"}`` shorthand messages."""
+    def append_role_content(self, role_content: RoleContent) -> None:
+        """Append ``{role: content}`` entries, or a list of those dicts."""
         self.extend_role_content(role_content)
 
-    def extend_role_content(self, role_content: dict[str, Any]) -> None:
-        """Extend with shorthand messages preserving mapping insertion order."""
-        for role, content in role_content.items():
-            self.append({"role": str(role), "content": content})
+    def extend_role_content(self, role_content: RoleContent) -> None:
+        """Extend with ``{role: content}`` entries, or a list of those dicts."""
+        if isinstance(role_content, list):
+            for item in role_content:
+                self._extend_role_content_dict(item)
+            return
+        if not isinstance(role_content, dict):
+            raise TypeError("role_content must be a {role: content} dict or a list of those dicts")
+        self._extend_role_content_dict(role_content)
 
     def copy_messages(self) -> list[dict[str, Any]]:
         """Return a shallow copy safe to pass to a chat completion call."""
         return [dict(message) for message in self]
 
+    def _extend_role_content_dict(self, item: Any) -> None:
+        if not isinstance(item, dict):
+            raise TypeError("role_content list items must be dicts")
+        for role, content in item.items():
+            self.append({"role": str(role), "content": content})
+
 
 class ChatSession:
     """Stateful dialogue wrapper with default create parameters."""
 
-    def __init__(self, chat: Any, **default_params: Any) -> None:
+    def __init__(
+        self,
+        chat: Any,
+        *,
+        role_content: RoleContent | None = None,
+        **default_params: Any,
+    ) -> None:
         self.chat = chat
         self.default_params = dict(default_params)
         self.messages = ChatMessages()
+        if role_content is not None:
+            self.messages.append_role_content(role_content)
         self.last_result: PipelinedChatCompletionResult | None = None
 
     async def step(
         self,
         *,
-        role_content: dict[str, Any] | None = None,
+        role_content: RoleContent | None = None,
         auto_append: bool = True,
         **override_params: Any,
     ) -> PipelinedChatCompletionResult:
@@ -44,9 +65,8 @@ class ChatSession:
         Parameters
         ----------
         role_content:
-            Optional shorthand messages to append before the model call. For
-            example ``{"user": "Continue"}`` becomes
-            ``{"role": "user", "content": "Continue"}``.
+            Optional ``{role: content}`` dict, or a list of those dicts, to
+            append before the model call.
         auto_append:
             When True, append the final assistant answer to ``session.messages``
             after the model call succeeds. This does not control
@@ -102,6 +122,11 @@ class ChatSession:
         return dict(message)
 
 
-def chat_session(chat: Any, **default_params: Any) -> ChatSession:
-    """Create a stateful chat session around a pipelined chat object."""
-    return ChatSession(chat, **default_params)
+def chat_session(
+    chat: Any,
+    *,
+    role_content: RoleContent | None = None,
+    **default_params: Any,
+) -> ChatSession:
+    """Create a stateful chat session around Pipelined Chat."""
+    return ChatSession(chat, role_content=role_content, **default_params)

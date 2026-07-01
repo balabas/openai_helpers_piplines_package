@@ -1,16 +1,55 @@
-# openai-helpers-piplines-package
-
 Reusable helpers for OpenAI-compatible local model workflows.
 
-The main API wraps `client.chat.completions` and keeps the original `create(...)` parameters, while adding optional pipeline parameters per call.
+## Core Idea
 
-Internally, pipeline execution is streaming-only. The wrapper sends `stream=True` for every model call so logger and loop-guard layers can observe tokens while they are generated.
+This is a thin hardening wrapper over `chat.completions.create`, aimed at **local / OpenAI-compatible model servers** (llama.cpp, vLLM, and similar) where the weak model and the endpoint are less reliable than a hosted frontier API.
 
-## Install
+You keep the OpenAI call you already know. Per call, you opt into the recovery behavior you want:
 
-````bash
-pip install -e /home/ubn/Documents/projects/openai_helpers_piplines_package
+- **Tool calling** restore randomly failed local call or MCP-like clients.
+- **Structured output** restore randomly failed against a `schema_dict`, with a separate repair round when the first parse fails.
+- **Loop guard** restore randomly looped model output.
+- **truncation recovery** restore if model exceeds tokens.
+- **Logging** of the full request/stream/tool/trace timeline.
+
+
+## API Shape
+
+There are two call paths.
+
+Stateless calls construct Pipelined Chat from Configured Pipelines, then call `create(...)`:
+
+````python
+chat = pipelined_chat(
+    client.chat.completions,
+    pipelines=pipelines,
+)
+
+result = await chat.create(
+    messages=messages,
+    **llm_request_params,
+)
 ````
+
+Stateful calls wrap the same Pipelined Chat with `chat_session(...)`:
+
+````python
+session = chat_session(
+    chat,
+    role_content=[
+        {"system": "You are concise."},
+    ],
+    **default_llm_request_params,
+)
+
+result = await session.step(
+    role_content=[
+        {"user": "Answer in one sentence."},
+    ],
+    **override_llm_request_params,
+)
+````
+
 
 ## Main API
 
@@ -22,8 +61,9 @@ from openai_helpers_piplines_package import (
     LoopGuardPipeline,
     PipelineRequestError,
     ToolPipeline,
+    attempt,
     chat_session,
-    with_pipelines,
+    pipelined_chat,
 )
 
 client = OpenAI(
@@ -31,21 +71,15 @@ client = OpenAI(
     api_key="not-needed-for-local-server",
 )
 
-chat = with_pipelines(
+chat = pipelined_chat(
     client.chat.completions,
-    layers=[
+    pipelines=[
         LoggerPipeline(path="pipeline.log"),
         ToolPipeline(max_retries=3),
         LoopGuardPipeline(max_retries=2),
         JsonFixPipeline(max_retries=2),
     ],
 )
-
-async def attempt(coro):
-    try:
-        return await coro
-    except PipelineRequestError as error:
-        return error
 
 result = await attempt(chat.create(
     model="your-model",
@@ -71,22 +105,36 @@ else:
     print(result.trace)
 ````
 
-`with_pipelines(...)` returns `PipelinedChatCompletions`, which exposes an async `create(...)` method.
+Pipelined Chat is the object returned by `pipelined_chat(...)`. It exposes an async `create(...)` method.
 
 The mental model is:
 
 ````text
-client.chat.completions.create(...)
-+ optional pipeline parameters
+pipelined_chat(client.chat.completions, pipelines=...)
+    .create(messages=[...], **request_params)
+
+chat_session(
+    pipelined_chat(...),
+    role_content=[
+        {"system": "..."},
+    ],
+    **default_request_params,
+)
+    .step(
+        role_content=[
+            {"user": "..."},
+        ],
+        **override_request_params,
+    )
 ````
 
 ## Local OpenAI-Compatible Server
 
-Use the OpenAI Python SDK for local OpenAI-compatible servers. This package does not implement its own HTTP transport layer.
+Use the OpenAI Python SDK for local OpenAI-compatible servers. This package does not implement its own HTTP transport.
 
 ````python
 from openai import OpenAI
-from openai_helpers_piplines_package import with_pipelines
+from openai_helpers_piplines_package import pipelined_chat
 
 client = OpenAI(
     base_url="http://127.0.0.1:8080/v1",
@@ -95,9 +143,9 @@ client = OpenAI(
 
 model_name = client.models.list().data[0].id
 
-chat = with_pipelines(
+chat = pipelined_chat(
     client.chat.completions,
-    layers=[...],
+    pipelines=[...],
 )
 ````
 
@@ -105,23 +153,24 @@ chat = with_pipelines(
 
 Use `chat_session(...)` when you want to keep dialogue history and avoid repeating stable request parameters.
 
+`session.step(...)` calls `chat.create(messages=session.messages.copy_messages(), **merged_params)`.
+
 ````python
 session = chat_session(
     chat,
+    role_content=[
+        {"system": "You must call the add tool for arithmetic."},
+    ],
     model=model_name,
     temperature=0.1,
     tool_sources=[{"add": add}],
     return_trace=True,
 )
 
-session.messages.append_role_content({
-    "system": "You must call the add tool for arithmetic.",
-})
-
 result = await session.step(
-    role_content={
-        "user": "Call the add tool to compute 7 + 8, then return JSON with answer and method.",
-    },
+    role_content=[
+        {"user": "Call the add tool to compute 7 + 8, then return JSON with answer and method."},
+    ],
     max_tokens=600,
     schema_dict={"answer": str, "method": str},
 )
@@ -136,7 +185,7 @@ session.messages.append({
 })
 ````
 
-Use the explicit shorthand when you only need role/content:
+Append a `role_content` dict where each key is a role and each value is content:
 
 ````python
 session.messages.append_role_content({
@@ -144,17 +193,17 @@ session.messages.append_role_content({
 })
 ````
 
-Or pass pre-step shorthand directly to `step(...)`:
+Or pass pre-step `role_content` directly to `step(...)`:
 
 ````python
 result2 = await session.step(
-    role_content={"user": "Continue: compute 20 + 22."},
+    role_content=[
+        {"user": "Continue: compute 20 + 22."},
+    ],
     max_tokens=300,
     schema_dict={"answer": str, "method": str},
 )
 ````
-
-`role_content` is consumed by the session and appended before the model call. It is not forwarded to `chat.create(...)`.
 
 Each step can override session defaults.
 
@@ -164,7 +213,9 @@ Manual mode:
 
 ````python
 result = await session.step(
-    role_content={"user": "Try again with a shorter answer."},
+    role_content=[
+        {"user": "Try again with a shorter answer."},
+    ],
     auto_append=False,
     max_tokens=300,
     schema_dict={"answer": str},
@@ -180,7 +231,7 @@ else:
 
 ## Pipeline Parameters
 
-Layer configuration belongs to layer objects:
+Pipeline configuration belongs to the pipeline objects:
 
 ````python
 ToolPipeline(max_retries=3)
@@ -206,24 +257,24 @@ else:
     print(result.parsed)
 ````
 
-`schema_dict` is optional. If it is passed, `JsonFixPipeline` must be present in `layers`.
+`schema_dict` is optional. If it is passed, include `JsonFixPipeline` in `pipelines=[...]`.
 
-`tool_sources` is optional. If it is passed, `ToolPipeline` must be present in `layers`.
+`tool_sources` is optional. If it is passed, include `ToolPipeline` in `pipelines=[...]`.
 
 Normal OpenAI-compatible arguments such as `model`, `messages`, `temperature`, `max_tokens`, `tools`, `tool_choice`, and `response_format` are forwarded to the source `create(...)` call unless the pipeline needs to add generated tool schemas.
 
 `stream` is managed by the wrapper. Callers do not need to pass it.
 
-The layer objects themselves are lightweight configuration markers. The wrapper owns the retry orchestration and the visible layer order is for readability and tracing.
+The pipeline objects are lightweight configuration markers. The wrapper owns the retry orchestration; the visible order in `pipelines=[...]` is for readability and tracing.
 
-## Layer Semantics
+## Pipeline Semantics
 
-Pipelines are layered wrappers, not one flat procedure.
+Pipelines are configured wrappers, not one flat procedure.
 
-Recommended visible order in `layers=[...]`:
+Recommended visible order in `pipelines=[...]`:
 
 ````python
-layers=[
+pipelines=[
     LoggerPipeline(path="pipeline.log"),
     ToolPipeline(max_retries=3),
     LoopGuardPipeline(max_retries=2),
@@ -241,7 +292,7 @@ create(...)
 -> run tool-call rounds when tool calls are present
 ````
 
-If layers are configured in a different visible order, the wrapper emits a warning. The warning exists because wrong ordering makes traces and mental models confusing; it does not mean list position changes the execution graph.
+If pipelines are configured in a different visible order, the wrapper emits a warning. The warning exists because wrong ordering makes traces and mental models confusing; it does not mean list position changes the execution graph.
 
 `JsonFixPipeline.max_retries` controls the number of repair rounds after the initial heuristic parse fails.
 
@@ -251,9 +302,7 @@ If layers are configured in a different visible order, the wrapper emits a warni
 
 `ToolPipeline` handles tool-call normalization, execution, and message construction. Empty tool-round output is nudged with a follow-up user message; truncated output is retried with a larger `max_tokens`.
 
-When `ToolPipeline` and `JsonFixPipeline` are combined, the wrapper does not force tool calling and structured JSON repair into the same model request. Tool execution runs first. If the final tool-pipeline result is not valid for `schema_dict`, JSON repair continues without tool schemas.
-
-Use `return_trace=True` when you need layer visibility:
+Use `return_trace=True` when you need pipeline trace visibility:
 
 ````python
 for event in result.trace:
@@ -271,7 +320,40 @@ result.trace           # list[PipelineEvent] if return_trace=True, else None
 result.messages        # final message history
 result.raw_responses   # all raw chat responses from the run
 result.tool_executions # executed tool calls
+result.usage           # token usage for the final response
+result.run_usage       # token usage summed across all raw_responses
 ````
+
+Assistant answer text and optional reasoning text are inside the final response
+message:
+
+````python
+message = result.response["choices"][0]["message"]
+
+answer = message.get("content", "")
+reasoning_content = message.get("reasoning_content", "")
+````
+
+Token usage is provider metadata:
+
+````python
+final_usage = result.usage
+final_tokens = final_usage.get("total_tokens")
+
+run_usage = result.run_usage
+run_tokens = run_usage.get("total_tokens")
+````
+
+Use `result.usage` when you only need the final model response. Use
+`result.run_usage` when the call may include tool rounds, loop/truncation
+retries, or Structured Output repair calls.
+
+Mechanism: Pipelined Chat streams requests with `stream=True` and
+`stream_options={"include_usage": True}`. OpenAI-compatible providers that
+support this option emit usage metadata in the stream; the package stores the
+last usage object on the assembled response. See the OpenAI API reference for
+`stream_options.include_usage`:
+https://platform.openai.com/docs/api-reference/chat/create#chat-create-stream_options
 
 ## Error Handling
 
@@ -294,6 +376,7 @@ from openai_helpers_piplines_package import (
     PipelineRequestError,
     StructuredOutputRepairExhaustedError,
     ToolIterationLimitExceededError,
+    attempt,
     classify_pipeline_error,
 )
 
@@ -327,16 +410,6 @@ Structured output repair is not silent when it runs out of retries: if heuristic
 When a failure is an expected branch in a sequence, wrap the call so expected pipeline errors come back as a value while everything else still raises:
 
 ````python
-async def attempt(coro):
-    try:
-        return await coro
-    except PipelineRequestError as error:
-        return error
-    except (ValueError, RuntimeError) as error:
-        if classify_pipeline_error(error) is not None:
-            return error
-        raise
-
 result = await attempt(chat.create(messages=msgs, schema_dict=schema))
 kind = classify_pipeline_error(result)
 if kind is not None:
@@ -349,14 +422,14 @@ A genuine bug (for example a `TypeError` in your own code) is not wrapped: it ke
 
 ## Logging
 
-Use `LoggerPipeline` as a normal layer:
+Use `LoggerPipeline` as a normal pipeline:
 
 ````python
-from openai_helpers_piplines_package import LoggerPipeline, with_pipelines
+from openai_helpers_piplines_package import LoggerPipeline, pipelined_chat
 
-chat = with_pipelines(
+chat = pipelined_chat(
     client.chat.completions,
-    layers=[
+    pipelines=[
         LoggerPipeline(path="pipeline.log"),
         ToolPipeline(max_retries=3),
         LoopGuardPipeline(max_retries=2),
@@ -372,7 +445,11 @@ The log includes:
 - streamed thinking/message chunks while the model is generating
 - tool calls and tool results
 - pipeline trace events
-- response end metadata
+- response end metadata, including final-response token usage when provided
+
+When the provider streams thinking fields, the assembled Result response stores
+them as `message["reasoning_content"]`. The final assistant answer remains
+`message["content"]`.
 
 Most code should use `LoggerPipeline(path=...)` directly. If you need to share one
 file writer across multiple wrappers, build a `PipelineLogger` from the internal
@@ -384,9 +461,9 @@ from pipelines.logger import PipelineLogger
 
 logger = PipelineLogger("pipeline.log")
 
-chat = with_pipelines(
+chat = pipelined_chat(
     client.chat.completions,
-    layers=[
+    pipelines=[
         LoggerPipeline(logger=logger),
         ToolPipeline(max_retries=3),
     ],
@@ -395,7 +472,8 @@ chat = with_pipelines(
 
 ## Tool Sources
 
-Local tools can be passed as a dictionary:
+### Local tools 
+can be passed as a dictionary:
 
 ````python
 def add(arguments: dict[str, int]) -> dict[str, int]:
@@ -433,6 +511,7 @@ else:
     print(result.response)
 ````
 
+### MCP
 MCP-like clients are supported when they expose:
 
 ````python
@@ -460,9 +539,9 @@ else:
 Use `schema_dict` per call:
 
 ````python
-chat = with_pipelines(
+chat = pipelined_chat(
     client.chat.completions,
-    layers=[JsonFixPipeline(max_retries=2)],
+    pipelines=[JsonFixPipeline(max_retries=2)],
 )
 
 result = await attempt(chat.create(
@@ -567,27 +646,3 @@ validated = Model.model_validate(
 print(validated.model_dump())
 print(Model.model_json_schema())
 ````
-
-## Demo Notebook
-
-The package includes a notebook that talks to a local OpenAI-compatible model server:
-
-[demo.ipynb](./demo.ipynb)
-
-Default endpoint:
-
-````text
-http://127.0.0.1:8080/v1
-````
-
-Override endpoint and model:
-
-````bash
-export OPENAI_HELPERS_BASE_URL=http://127.0.0.1:8080/v1
-export OPENAI_HELPERS_MODEL=your-model-name
-````
-
-## Notes
-
-- Requires `pydantic>=2.0`.
-- The package currently uses the project name spelling `piplines` to match the existing folder and import path.

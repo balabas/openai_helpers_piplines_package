@@ -2,17 +2,26 @@
 
 ## Self-Correction
 
-Be careful with semantics, levels, layers, and visibility before proposing names, APIs, or implementation changes.
+Be careful with semantics, levels, and visibility before proposing names, APIs, or implementation changes.
 
 When corrected by the user, treat the correction as a semantic constraint for future reasoning in the current project. Update explanations and future suggestions to preserve that constraint.
 
-Do not flatten layered behavior into one opaque abstraction when the design requires visible layers, events, or responsibilities.
+Do not flatten distinct behavior into one opaque abstraction when the design requires visible events or responsibilities.
+
+fix all user-faces terms in glossary and analyze first semantic of names in code, semantic conflicts, redudant terms, synonyms, what is constant, and what could be changed.
+at first analyse code cleanrness for user.
+if you need introduce new external term, then get my acception.
+
+Read `TERMS_RELATIONS.md` before changing public API names, README/notebook wording,
+examples, or user-facing errors. If a user instruction conflicts with
+`TERMS_RELATIONS.md`, warn about the conflict and change the taxonomy only after the
+user explicitly accepts it.
 
 ## Naming
 
 Prefer unifying names with existing close semantic patterns in the codebase instead of inventing new names.
 
-Use the same option name only when the semantic role is actually the same. If the same option name appears in multiple layers or components, its meaning may be scoped by that layer or component.
+Use the same option name only when the semantic role is actually the same. If the same option name appears in multiple scopes, its meaning may be scoped by that owner.
 
 Avoid adding near-duplicate names for behavior already represented by an existing option.
 

@@ -1,4 +1,4 @@
-"""Exception-correctness tests for every pipeline layer.
+"""Exception-correctness tests for every pipeline error path.
 
 Each path that can raise, retry, or degrade is driven through a fake streaming
 backend (see ``fake_chat``) so the behaviour is deterministic and offline.
@@ -41,8 +41,10 @@ from openai_helpers_piplines_package import (  # noqa: E402
     StructuredOutputRepairExhaustedError,
     ToolPipeline,
     ToolIterationLimitExceededError,
+    attempt,
+    chat_session,
     classify_pipeline_error,
-    with_pipelines,
+    pipelined_chat,
 )
 from openai import APIConnectionError, OpenAI  # noqa: E402
 
@@ -81,7 +83,7 @@ def _live_client_and_model():
 
 def test_plain_text_response():
     backend = FakeChatCompletions([text_turn("hello world")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(messages=[{"role": "user", "content": "hi"}])
@@ -92,9 +94,138 @@ def test_plain_text_response():
     assert result.parsed is None
 
 
+def test_result_exposes_final_response_usage():
+    usage = {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    backend = FakeChatCompletions([text_turn("hello world", usage=usage)])
+    chat = pipelined_chat(backend, pipelines=[])
+
+    async def go():
+        return await chat.create(messages=[{"role": "user", "content": "hi"}])
+
+    result = _run(go())
+    assert result.usage == usage
+    assert result.run_usage == usage
+
+
+def test_result_exposes_aggregated_run_usage():
+    backend = FakeChatCompletions(
+        [
+            tool_call_turn("add", {"a": 1, "b": 2}),
+            text_turn(
+                "done",
+                usage={"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+            ),
+        ]
+    )
+    backend._turns[0][-1]["usage"] = {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
+
+    async def go():
+        return await chat.create(
+            messages=[{"role": "user", "content": "add"}],
+            tool_sources=[{"add": lambda arguments: {"sum": arguments["a"] + arguments["b"]}}],
+        )
+
+    result = _run(go())
+    assert result.usage == {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
+    assert result.run_usage == {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+
+
+def test_attempt_is_root_package_helper():
+    import openai_helpers_piplines_package as package
+
+    assert package.attempt is attempt
+
+
+def test_pipelined_chat_accepts_pipelines_keyword():
+    backend = FakeChatCompletions([text_turn('{"x": 1}')])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline()])
+
+    async def go():
+        return await chat.create(messages=[{"role": "user", "content": "json"}], schema_dict={"x": int})
+
+    result = _run(go())
+    assert result.parsed == {"x": 1}
+
+
+def test_pipelined_chat_rejects_pipelines_with_legacy_alias():
+    backend = FakeChatCompletions([text_turn("hello")])
+
+    try:
+        pipelined_chat(backend, pipelines=[], layers=[])
+    except ValueError as exc:
+        assert "pipelines=" in str(exc)
+        assert "legacy compatibility alias" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when both pipeline keywords are passed")
+
+
+def test_chat_session_accepts_initial_role_content():
+    backend = FakeChatCompletions([text_turn("ok")])
+    chat = pipelined_chat(backend, pipelines=[])
+    session = chat_session(
+        chat,
+        role_content={"system": "use json"},
+        model="demo-model",
+    )
+
+    async def go():
+        return await session.step(role_content={"user": "say ok"})
+
+    result = _run(go())
+
+    assert result.response["choices"][0]["message"]["content"] == "ok"
+    assert session.default_params == {"model": "demo-model"}
+    assert backend.calls[0]["model"] == "demo-model"
+    assert "role_content" not in backend.calls[0]
+    assert backend.calls[0]["messages"] == [
+        {"role": "system", "content": "use json"},
+        {"role": "user", "content": "say ok"},
+    ]
+
+
+def test_chat_session_accepts_role_content_lists():
+    backend = FakeChatCompletions([text_turn("ok")])
+    chat = pipelined_chat(backend, pipelines=[])
+    session = chat_session(
+        chat,
+        role_content=[
+            {"system": "use json"},
+            {"developer": "stay compact"},
+        ],
+    )
+
+    async def go():
+        return await session.step(
+            role_content=[
+                {"user": "say ok"},
+            ],
+        )
+
+    _run(go())
+
+    assert backend.calls[0]["messages"] == [
+        {"role": "system", "content": "use json"},
+        {"role": "developer", "content": "stay compact"},
+        {"role": "user", "content": "say ok"},
+    ]
+
+
+def test_chat_session_rejects_invalid_role_content_list_items():
+    backend = FakeChatCompletions([text_turn("ok")])
+    chat = pipelined_chat(backend, pipelines=[])
+
+    try:
+        chat_session(chat, role_content=[{"system": "ok"}, "bad"])
+    except TypeError as exc:
+        assert "role_content list items must be dicts" in str(exc)
+    else:
+        raise AssertionError("expected TypeError for invalid role_content list item")
+
+
 def test_async_backend_aiter_path():
     backend = AsyncFakeChatCompletions([text_turn("async answer", n_chunks=3)])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(messages=[{"role": "user", "content": "hi"}])
@@ -105,7 +236,7 @@ def test_async_backend_aiter_path():
 
 def test_reasoning_then_content_streamed():
     backend = FakeChatCompletions([text_turn("final", reasoning="let me think")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(messages=[{"role": "user", "content": "hi"}])
@@ -117,12 +248,12 @@ def test_reasoning_then_content_streamed():
 
 
 # --------------------------------------------------------------------------- #
-# JSON / schema layer
+# JSON / schema pipeline
 # --------------------------------------------------------------------------- #
 
 def test_schema_success():
     backend = FakeChatCompletions([text_turn('{"x": 5}')])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline()])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline()])
 
     async def go():
         return await chat.create(
@@ -138,7 +269,7 @@ def test_schema_success():
 
 def test_schema_invalid_then_retry_succeeds():
     backend = FakeChatCompletions([text_turn("not json at all"), text_turn('{"x": 7}')])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -157,7 +288,7 @@ def test_schema_exhausted_raises_after_retries():
     # Model can't produce JSON -> exhausted repair must now raise instead of
     # fabricating a fallback value.
     backend = FakeChatCompletions([text_turn("still not json"), text_turn("still not json repair")])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline(max_retries=0)])
 
     async def go():
         return await chat.create(
@@ -180,7 +311,7 @@ def test_schema_exhausted_raises_after_retries():
 
 def test_empty_assistant_output_is_classified():
     backend = FakeChatCompletions([text_turn("")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(messages=[{"role": "user", "content": "say something"}])
@@ -208,7 +339,7 @@ def _raise_at(stage, error, seen=None):
 def test_debug_stage_can_raise_empty_assistant_output_at_package_site():
     seen = []
     backend = FakeChatCompletions([text_turn("")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(
@@ -233,7 +364,7 @@ def test_debug_stage_can_raise_empty_assistant_output_at_package_site():
 def test_debug_stage_can_raise_structured_repair_exhausted_at_package_site():
     seen = []
     backend = FakeChatCompletions([text_turn("not json"), text_turn("still not json")])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline(max_retries=0)])
 
     async def go():
         return await chat.create(
@@ -262,7 +393,7 @@ def test_inline_toolcall_text_with_schema_raises_after_repair_exhaustion():
     # raises once the repair budget is exhausted.
     inline = "<tool_call> <function=add> <parameter=a> 3 </parameter> </function> </tool_call>"
     backend = FakeChatCompletions([text_turn(inline), text_turn(inline), text_turn(inline)])
-    chat = with_pipelines(backend, layers=[ToolPipeline(), JsonFixPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(), JsonFixPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -287,7 +418,7 @@ def test_schema_validation_error_is_retried():
     # Valid JSON, but wrong type for a required int field -> pydantic ValidationError,
     # which must be caught by the (ValueError-based) retry, not escape.
     backend = FakeChatCompletions([text_turn('{"x": "abc"}'), text_turn('{"x": 3}')])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -303,7 +434,7 @@ def test_schema_validation_error_is_retried():
 
 def test_schema_dict_without_jsonfix_raises():
     backend = FakeChatCompletions([text_turn("x")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(
@@ -316,11 +447,11 @@ def test_schema_dict_without_jsonfix_raises():
     except ValueError as exc:
         assert "JsonFixPipeline" in str(exc)
     else:
-        raise AssertionError("expected ValueError without JsonFixPipeline layer")
+        raise AssertionError("expected ValueError without JsonFixPipeline")
 
 
 # --------------------------------------------------------------------------- #
-# Tool layer
+# Tool pipeline
 # --------------------------------------------------------------------------- #
 
 def _add(a: int, b: int) -> dict:
@@ -331,7 +462,7 @@ def test_tool_call_then_final_answer():
     backend = FakeChatCompletions(
         [tool_call_turn("add", {"a": 1, "b": 2}), text_turn("the sum is 3")]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -350,7 +481,7 @@ def test_unknown_tool_is_graceful():
     backend = FakeChatCompletions(
         [tool_call_turn("subtract", {"a": 1, "b": 2}), text_turn("done")]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -369,7 +500,7 @@ def test_handler_exception_is_captured():
     backend = FakeChatCompletions(
         [tool_call_turn("boom", {"a": 1}), text_turn("recovered")]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -389,7 +520,7 @@ def test_nonserializable_tool_result_is_stringified_not_failed():
     backend = FakeChatCompletions(
         [tool_call_turn("now", {"a": 1}), text_turn("ok")]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -405,7 +536,7 @@ def test_nonserializable_tool_result_is_stringified_not_failed():
 
 def test_tool_sources_without_toolpipeline_raises():
     backend = FakeChatCompletions([text_turn("x")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(
@@ -418,7 +549,7 @@ def test_tool_sources_without_toolpipeline_raises():
     except ValueError as exc:
         assert "ToolPipeline" in str(exc)
     else:
-        raise AssertionError("expected ValueError without ToolPipeline layer")
+        raise AssertionError("expected ValueError without ToolPipeline")
 
 
 def test_truncated_tool_result_returns_result_not_none():
@@ -431,7 +562,7 @@ def test_truncated_tool_result_returns_result_not_none():
             text_turn("final answer"),
         ]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline(max_retries=0)])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(max_retries=0)])
 
     async def go():
         return await chat.create(
@@ -456,7 +587,7 @@ def test_broken_empty_tool_result_heats_up_then_recovers():
             text_turn("final answer"),
         ]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -476,7 +607,7 @@ def test_loop_guard_retry_escalates_temperature_no_injection():
     # Ported run_loop_guard: on loop -> discard partial, raise temperature,
     # re-roll with NO injected prompt. From greedy/unset the first retry -> 0.1.
     backend = FakeChatCompletions([loop_turn(), text_turn("clean answer")])
-    chat = with_pipelines(backend, layers=[LoopGuardPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[LoopGuardPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -502,7 +633,7 @@ def test_truncated_tool_result_boosts_max_tokens():
             text_turn("done"),
         ]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -522,7 +653,7 @@ def test_schema_appended_as_user_hint_not_system():
     # Ported run_validation: schema goes onto an existing message as a text hint,
     # never as a new system message.
     backend = FakeChatCompletions([text_turn('{"x": 1}')])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline()])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline()])
 
     async def go():
         return await chat.create(
@@ -542,7 +673,7 @@ def test_tool_iteration_safety_limit_raises_runtimeerror():
     # 100 consecutive tool-call rounds with no final text -> internal safety limit.
     turns = [tool_call_turn("add", {"a": 1, "b": 1}) for _ in range(100)]
     backend = FakeChatCompletions(turns)
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -563,7 +694,7 @@ def test_tool_iteration_safety_limit_raises_runtimeerror():
 def test_debug_stage_can_raise_tool_iteration_limit_at_package_site():
     seen = []
     backend = FakeChatCompletions([tool_call_turn("add", {"a": 1, "b": 1}) for _ in range(20)])
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -588,12 +719,12 @@ def test_debug_stage_can_raise_tool_iteration_limit_at_package_site():
 
 
 # --------------------------------------------------------------------------- #
-# Loop-guard layer
+# Loop-guard pipeline
 # --------------------------------------------------------------------------- #
 
 def test_loop_detected_then_retry_recovers():
     backend = FakeChatCompletions([loop_turn(), text_turn("clean answer")])
-    chat = with_pipelines(backend, layers=[LoopGuardPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[LoopGuardPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -629,7 +760,7 @@ def test_json_repair_does_not_inject_midconversation_system():
             text_turn('{"answer": "7"}'),
         ]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline(), JsonFixPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(), JsonFixPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -647,7 +778,7 @@ def test_json_repair_does_not_inject_midconversation_system():
 
 def test_loop_retry_does_not_inject_midconversation_system():
     backend = FakeChatCompletions([loop_turn(), text_turn("short answer")])
-    chat = with_pipelines(backend, layers=[LoopGuardPipeline(max_retries=1)])
+    chat = pipelined_chat(backend, pipelines=[LoopGuardPipeline(max_retries=1)])
 
     async def go():
         return await chat.create(
@@ -674,7 +805,7 @@ def test_request_failure_surfaces_params_messages_and_provider_text():
         },
     )
     backend = FakeChatCompletions([text_turn("ok")])
-    chat = with_pipelines(backend, layers=[ToolPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline()])
 
     async def go():
         return await chat.create(
@@ -707,7 +838,7 @@ def test_request_failure_surfaces_params_messages_and_provider_text():
 
 def test_connection_error_surfaces_underlying_transport_cause():
     backend = FakeChatCompletions([text_turn("ok")])
-    chat = with_pipelines(backend, layers=[])
+    chat = pipelined_chat(backend, pipelines=[])
 
     async def go():
         return await chat.create(
@@ -732,7 +863,7 @@ def test_connection_error_surfaces_underlying_transport_cause():
 
 def test_live_client_debug_exception_reaches_chat_request_stage():
     client, model = _live_client_and_model()
-    chat = with_pipelines(client.chat.completions, layers=[])
+    chat = pipelined_chat(client.chat.completions, pipelines=[])
 
     async def go():
         return await chat.create(
@@ -757,7 +888,7 @@ def test_live_client_debug_exception_reaches_chat_request_stage():
 
 def test_live_client_debug_exception_reaches_tool_request_stage():
     client, model = _live_client_and_model()
-    chat = with_pipelines(client.chat.completions, layers=[ToolPipeline()])
+    chat = pipelined_chat(client.chat.completions, pipelines=[ToolPipeline()])
     err = FakeProviderError(
         "Error code: 400",
         body={"error": {"code": 400, "message": "live tool debug failure", "type": "invalid_request_error"}},
@@ -785,7 +916,7 @@ def test_live_client_debug_exception_reaches_tool_request_stage():
 
 def test_request_failure_during_json_repair_is_labelled():
     backend = FakeChatCompletions([text_turn("not json at all")])
-    chat = with_pipelines(backend, layers=[JsonFixPipeline(max_retries=0)])
+    chat = pipelined_chat(backend, pipelines=[JsonFixPipeline(max_retries=0)])
 
     async def go():
         return await chat.create(
@@ -821,7 +952,7 @@ def test_genuine_bug_propagates_with_context_note():
         def create(self, **kwargs):
             raise TypeError("genuine bug in backend")
 
-    chat = with_pipelines(BugBackend(), layers=[])
+    chat = pipelined_chat(BugBackend(), pipelines=[])
 
     async def go():
         return await chat.create(
@@ -849,13 +980,7 @@ def test_genuine_bug_is_not_caught_by_attempt_umbrella():
         def create(self, **kwargs):
             raise KeyError("missing thing")
 
-    chat = with_pipelines(BugBackend(), layers=[])
-
-    async def attempt(coro):
-        try:
-            return await coro
-        except PipelineRequestError as error:
-            return error
+    chat = pipelined_chat(BugBackend(), pipelines=[])
 
     async def go():
         return await attempt(chat.create(model="m", messages=[{"role": "user", "content": "x"}]))
@@ -870,7 +995,7 @@ def test_genuine_bug_is_not_caught_by_attempt_umbrella():
 
 def test_loop_unrepaired_is_labelled_not_passed():
     backend = FakeChatCompletions([loop_turn(), loop_turn(), loop_turn(), loop_turn()])
-    chat = with_pipelines(backend, layers=[LoopGuardPipeline(max_retries=0)])
+    chat = pipelined_chat(backend, pipelines=[LoopGuardPipeline(max_retries=0)])
 
     async def go():
         return await chat.create(
@@ -893,7 +1018,7 @@ def test_combined_tool_then_structured_output():
     backend = FakeChatCompletions(
         [tool_call_turn("add", {"a": 1, "b": 2}), text_turn('{"answer": "3"}')]
     )
-    chat = with_pipelines(backend, layers=[ToolPipeline(), LoopGuardPipeline(), JsonFixPipeline()])
+    chat = pipelined_chat(backend, pipelines=[ToolPipeline(), LoopGuardPipeline(), JsonFixPipeline()])
 
     async def go():
         return await chat.create(
@@ -916,7 +1041,7 @@ def test_logger_writes_without_raising():
             [tool_call_turn("add", {"a": 2, "b": 2}), text_turn("four", reasoning="adding")]
         )
         logger = LoggerPipeline(path=path)
-        chat = with_pipelines(backend, layers=[logger, ToolPipeline()])
+        chat = pipelined_chat(backend, pipelines=[logger, ToolPipeline()])
 
         async def go():
             return await chat.create(

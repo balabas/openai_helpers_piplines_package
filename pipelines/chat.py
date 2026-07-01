@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat.completions wrapper with layered pipeline semantics."""
+"""OpenAI-compatible chat.completions wrapper with pipeline semantics."""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, TypeVar
 
 from .json_fix import JsonFixPipeline, StructuredOutputRequest
 from .logger import LoggerPipeline
@@ -48,6 +48,8 @@ class PipelineDebugStage(StrEnum):
 EMPTY_ASSISTANT_OUTPUT_MESSAGE = "Empty assistant output"
 STRUCTURED_OUTPUT_REPAIR_EXHAUSTED_PREFIX = "Structured output repair exhausted"
 TOOL_ITERATION_LIMIT_PREFIX = "Exceeded internal tool iteration safety limit"
+
+_T = TypeVar("_T")
 
 
 def _request_error_kind_for_stage(stage: _RequestStage | str | None) -> PipelineErrorKind:
@@ -152,6 +154,19 @@ def classify_pipeline_error(error: BaseException) -> PipelineErrorKind | None:
         return PipelineErrorKind.TOOL_ITERATION_LIMIT_EXCEEDED
 
     return None
+
+
+async def attempt(coro: Awaitable[_T]) -> _T | BaseException:
+    """Return expected pipeline errors as values; let genuine bugs raise."""
+
+    try:
+        return await coro
+    except PipelineRequestError as error:
+        return error
+    except (ValueError, RuntimeError) as error:
+        if classify_pipeline_error(error) is not None:
+            return error
+        raise
 
 
 def _debug_exception(
@@ -328,6 +343,25 @@ def _usage(response: Any) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
+def _sum_usage(responses: list[Any]) -> dict[str, Any]:
+    totals: dict[str, Any] = {}
+    for response in responses:
+        _add_usage(totals, _usage(response))
+    return totals
+
+
+def _add_usage(target: dict[str, Any], usage: dict[str, Any]) -> None:
+    for key, value in usage.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            target[key] = int(target.get(key, 0)) + value
+        elif isinstance(value, dict):
+            nested = target.setdefault(key, {})
+            if isinstance(nested, dict):
+                _add_usage(nested, value)
+
+
 def _text_and_tool_calls(response: Any) -> tuple[str, list[dict[str, Any]]]:
     message = _message_from_response(response)
     text = str(message.get("content") or "")
@@ -385,6 +419,18 @@ class PipelinedChatCompletionResult:
     raw_responses: list[Any] = field(default_factory=list)
     tool_executions: list[ToolExecution] = field(default_factory=list)
 
+    @property
+    def usage(self) -> dict[str, Any]:
+        """Token usage for the final response."""
+
+        return _usage(self.response)
+
+    @property
+    def run_usage(self) -> dict[str, Any]:
+        """Aggregated token usage across every model response in this run."""
+
+        return _sum_usage(self.raw_responses or [self.response])
+
 
 @dataclass(slots=True)
 class _Generation:
@@ -408,10 +454,15 @@ class PipelinedChatCompletions:
         self,
         chat_completions: Any,
         *,
+        pipelines: Sequence[Any] | None = None,
         layers: Sequence[Any] | None = None,
     ) -> None:
+        if pipelines is not None and layers is not None:
+            raise ValueError("Pass pipelines= only once; the legacy compatibility alias cannot be combined with it")
         self.chat_completions = chat_completions
-        self.layers = self._normalize_layers(layers)
+        configured_pipelines = pipelines if pipelines is not None else layers
+        self.pipelines = self._normalize_pipelines(configured_pipelines)
+        self.layers = self.pipelines
 
     async def create(
         self,
@@ -424,29 +475,29 @@ class PipelinedChatCompletions:
         **chat_kwargs: Any,
     ) -> PipelinedChatCompletionResult:
         trace: list[PipelineEvent] = [
-            PipelineEvent("pipelined_chat", "start", {"layers": [type(layer).__name__ for layer in self.layers]})
+            PipelineEvent("pipelined_chat", "start", {"pipelines": [type(pipeline).__name__ for pipeline in self.pipelines]})
         ]
         current_messages = [dict(message) for message in messages]
 
-        json_layer = self._layer(JsonFixPipeline)
-        logger_layer = self._layer(LoggerPipeline)
-        loop_layer = self._layer(LoopGuardPipeline)
-        tool_layer = self._layer(ToolPipeline)
+        json_pipeline = self._pipeline_of_type(JsonFixPipeline)
+        logger_pipeline = self._pipeline_of_type(LoggerPipeline)
+        loop_pipeline = self._pipeline_of_type(LoopGuardPipeline)
+        tool_pipeline = self._pipeline_of_type(ToolPipeline)
 
-        if schema_dict is not None and json_layer is None:
-            raise ValueError("schema_dict requires JsonFixPipeline in layers")
-        if tool_sources is not None and tool_layer is None:
-            raise ValueError("tool_sources requires ToolPipeline in layers")
+        if schema_dict is not None and json_pipeline is None:
+            raise ValueError("schema_dict requires JsonFixPipeline in configured pipelines")
+        if tool_sources is not None and tool_pipeline is None:
+            raise ValueError("tool_sources requires ToolPipeline in configured pipelines")
 
         structured: StructuredOutputRequest | None = None
-        if schema_dict is not None and json_layer is not None:
-            structured = json_layer.build_request(messages=current_messages, schema_dict=schema_dict)
+        if schema_dict is not None and json_pipeline is not None:
+            structured = json_pipeline.build_request(messages=current_messages, schema_dict=schema_dict)
             current_messages = structured.messages
             trace.append(PipelineEvent("validation", "schema_prepared", {"schema_keys": list(schema_dict.keys())}))
 
         tool_schemas: list[dict[str, Any]] | None = None
         tool_registry: dict[str, ToolHandler] = {}
-        if tool_sources is not None and tool_layer is not None:
+        if tool_sources is not None and tool_pipeline is not None:
             tool_schemas, tool_registry = await self._resolve_tool_sources(tool_sources)
             trace.append(PipelineEvent("tool", "sources_resolved", {"count": len(tool_registry)}))
 
@@ -457,10 +508,10 @@ class PipelinedChatCompletions:
             generation = await self._generate_one(
                 messages=current_messages,
                 request_kwargs=base_request_kwargs,
-                json_layer=json_layer,
+                json_pipeline=json_pipeline,
                 structured=structured,
-                logger_layer=logger_layer,
-                loop_layer=loop_layer,
+                logger_pipeline=logger_pipeline,
+                loop_pipeline=loop_pipeline,
                 request_stage=(
                     _RequestStage.STRUCTURED_GENERATION
                     if structured is not None
@@ -491,11 +542,11 @@ class PipelinedChatCompletions:
                 trace.append(PipelineEvent("validation", "json_retry", {"error": "heuristic validation failed"}))
                 parsed, repair_response = await self._repair_structured_output(
                     generation=generation,
-                    json_layer=json_layer,
+                    json_pipeline=json_pipeline,
                     structured=structured,
                     request_kwargs=base_request_kwargs,
-                    logger_layer=logger_layer,
-                    loop_layer=loop_layer,
+                    logger_pipeline=logger_pipeline,
+                    loop_pipeline=loop_pipeline,
                 )
                 trace.append(PipelineEvent("validation", "parsed", {"keys": list(parsed.keys())}))
                 response = repair_response or generation.response
@@ -511,8 +562,8 @@ class PipelinedChatCompletions:
                     {"tool_rounds": 0, "loop_retries": 0, "json_retries": 0},
                 )
             )
-            self._log_events(logger_layer, trace)
-            self._log_end(logger_layer, response)
+            self._log_events(logger_pipeline, trace)
+            self._log_end(logger_pipeline, response)
             return PipelinedChatCompletionResult(
                 response=response,
                 parsed=parsed,
@@ -531,10 +582,10 @@ class PipelinedChatCompletions:
             generation = await self._generate_one(
                 messages=current_messages,
                 request_kwargs=base_request_kwargs,
-                json_layer=json_layer,
+                json_pipeline=json_pipeline,
                 structured=structured,
-                logger_layer=logger_layer,
-                loop_layer=loop_layer,
+                logger_pipeline=logger_pipeline,
+                loop_pipeline=loop_pipeline,
                 tool_schemas=tool_schemas,
                 request_stage=(
                     _RequestStage.TOOL_GENERATION
@@ -568,11 +619,11 @@ class PipelinedChatCompletions:
                     on_clarify=on_clarify,
                 )
                 tool_executions.extend(round_executions)
-                self._log_tool_results(logger_layer, round_executions)
+                self._log_tool_results(logger_pipeline, round_executions)
                 current_messages.extend(
                     [
                         self._assistant_message_from_generation(generation),
-                        *tool_layer.tool_messages(round_executions),
+                        *tool_pipeline.tool_messages(round_executions),
                     ]
                 )
                 trace.append(
@@ -590,11 +641,11 @@ class PipelinedChatCompletions:
                 trace.append(PipelineEvent("validation", "json_retry", {"error": "heuristic validation failed"}))
                 parsed, repair_response = await self._repair_structured_output(
                     generation=generation,
-                    json_layer=json_layer,
+                    json_pipeline=json_pipeline,
                     structured=structured,
                     request_kwargs=base_request_kwargs,
-                    logger_layer=logger_layer,
-                    loop_layer=loop_layer,
+                    logger_pipeline=logger_pipeline,
+                    loop_pipeline=loop_pipeline,
                 )
                 trace.append(PipelineEvent("validation", "parsed", {"keys": list(parsed.keys())}))
                 response = repair_response or response
@@ -611,8 +662,8 @@ class PipelinedChatCompletions:
                     },
                 )
             )
-            self._log_events(logger_layer, trace)
-            self._log_end(logger_layer, response)
+            self._log_events(logger_pipeline, trace)
+            self._log_end(logger_pipeline, response)
             return PipelinedChatCompletionResult(
                 response=response,
                 parsed=parsed,
@@ -638,19 +689,19 @@ class PipelinedChatCompletions:
         self,
         *,
         generation: _Generation,
-        json_layer: JsonFixPipeline | None,
+        json_pipeline: JsonFixPipeline | None,
         structured: StructuredOutputRequest,
         request_kwargs: dict[str, Any],
-        logger_layer: LoggerPipeline | None,
-        loop_layer: LoopGuardPipeline | None,
+        logger_pipeline: LoggerPipeline | None,
+        loop_pipeline: LoopGuardPipeline | None,
     ) -> tuple[dict[str, Any], Any | None]:
-        if json_layer is None:
-            raise ValueError("schema_dict requires JsonFixPipeline in layers")
+        if json_pipeline is None:
+            raise ValueError("schema_dict requires JsonFixPipeline in configured pipelines")
 
         fit_messages = [
             {
                 "role": "user",
-                "content": json_layer.build_fit_prompt(schema_json=structured.schema_json, raw_text=generation.text),
+                "content": json_pipeline.build_fit_prompt(schema_json=structured.schema_json, raw_text=generation.text),
             }
         ]
         fit_kwargs = dict(request_kwargs)
@@ -659,27 +710,27 @@ class PipelinedChatCompletions:
         fit_kwargs["response_format"] = _json_response_format(structured.schema_json, name=structured.model_cls.__name__)
 
         last_response: Any | None = None
-        for retry_index in range(json_layer.max_retries + 1):
+        for retry_index in range(json_pipeline.max_retries + 1):
             repaired = await self._generate_one(
                 messages=fit_messages,
                 request_kwargs=fit_kwargs,
-                json_layer=None,
+                json_pipeline=None,
                 structured=structured,
-                logger_layer=logger_layer,
-                loop_layer=loop_layer,
+                logger_pipeline=logger_pipeline,
+                loop_pipeline=loop_pipeline,
                 force_response_format=fit_kwargs["response_format"],
                 request_stage=_RequestStage.JSON_REPAIR,
             )
             last_response = repaired.response
             try:
-                parsed = json_layer.parse(repaired.text, structured.model_cls)
+                parsed = json_pipeline.parse(repaired.text, structured.model_cls)
             except Exception:
                 parsed = None
             if parsed is not None:
                 return parsed, repaired.response
-            if retry_index < json_layer.max_retries:
+            if retry_index < json_pipeline.max_retries:
                 fit_messages.extend(
-                    json_layer.build_retry_messages(
+                    json_pipeline.build_retry_messages(
                         previous_text=repaired.text,
                         error=ValueError("Previous JSON failed validation"),
                         schema_json=structured.schema_json,
@@ -691,11 +742,11 @@ class PipelinedChatCompletions:
                 "debug_stage": PipelineDebugStage.STRUCTURED_OUTPUT_REPAIR_EXHAUSTED,
                 "messages": fit_messages,
                 "request_stage": _RequestStage.JSON_REPAIR,
-                "attempts": json_layer.max_retries + 1,
+                "attempts": json_pipeline.max_retries + 1,
             },
             callable_only=True,
         )
-        raise StructuredOutputRepairExhaustedError(json_layer.max_retries + 1)
+        raise StructuredOutputRepairExhaustedError(json_pipeline.max_retries + 1)
 
     def _construct_fallback(self, model_cls: Any, text: str) -> dict[str, Any]:
         fields = getattr(model_cls, "model_fields", {})
@@ -709,17 +760,17 @@ class PipelinedChatCompletions:
         *,
         messages: list[dict[str, Any]],
         request_kwargs: dict[str, Any],
-        json_layer: JsonFixPipeline | None,
+        json_pipeline: JsonFixPipeline | None,
         structured: StructuredOutputRequest | None,
-        logger_layer: LoggerPipeline | None,
-        loop_layer: LoopGuardPipeline | None,
+        logger_pipeline: LoggerPipeline | None,
+        loop_pipeline: LoopGuardPipeline | None,
         tool_schemas: list[dict[str, Any]] | None = None,
         force_response_format: dict[str, Any] | None = None,
         request_stage: _RequestStage | str = _RequestStage.CHAT_GENERATION,
     ) -> _Generation:
         base_messages = [dict(message) for message in messages]
-        if structured is not None and json_layer is not None:
-            base_messages = json_layer.append_schema_hint(base_messages, structured.schema_json)
+        if structured is not None and json_pipeline is not None:
+            base_messages = json_pipeline.append_schema_hint(base_messages, structured.schema_json)
 
         base_temperature = request_kwargs.get("temperature")
         base_max_tokens = int(request_kwargs.get("max_tokens") or self._DEFAULT_MAX_TOKENS)
@@ -747,8 +798,8 @@ class PipelinedChatCompletions:
             if response_format is not None:
                 current_kwargs["response_format"] = response_format
 
-            if logger_layer is not None:
-                logger_layer.logger.log_request(current_kwargs)
+            if logger_pipeline is not None:
+                logger_pipeline.logger.log_request(current_kwargs)
 
             try:
                 response = await self._call_create(
@@ -762,8 +813,8 @@ class PipelinedChatCompletions:
                 if response_format_type == "json_schema" and ("json_schema" in error_text or "response_format" in error_text):
                     fallback_kwargs = dict(current_kwargs)
                     fallback_kwargs["response_format"] = {"type": "json_object"}
-                    if logger_layer is not None:
-                        logger_layer.logger.log_request(fallback_kwargs)
+                    if logger_pipeline is not None:
+                        logger_pipeline.logger.log_request(fallback_kwargs)
                     response = await self._call_create(
                         fallback_kwargs,
                         request_stage=request_stage,
@@ -772,10 +823,10 @@ class PipelinedChatCompletions:
                     current_kwargs = fallback_kwargs
                 else:
                     raise
-            generation = await self._consume_stream(response, logger_layer, loop_layer)
-            if structured is not None and json_layer is not None and not generation.tool_calls:
+            generation = await self._consume_stream(response, logger_pipeline, loop_pipeline)
+            if structured is not None and json_pipeline is not None and not generation.tool_calls:
                 try:
-                    generation.parsed = json_layer.parse(generation.text, structured.model_cls)
+                    generation.parsed = json_pipeline.parse(generation.text, structured.model_cls)
                 except Exception:
                     generation.parsed = None
                 else:
@@ -836,8 +887,8 @@ class PipelinedChatCompletions:
     async def _consume_stream(
         self,
         stream: Any,
-        logger_layer: LoggerPipeline | None,
-        loop_layer: LoopGuardPipeline | None,
+        logger_pipeline: LoggerPipeline | None,
+        loop_pipeline: LoopGuardPipeline | None,
     ) -> _Generation:
         chunks: list[dict[str, Any]] = []
         content_parts: list[str] = []
@@ -883,10 +934,10 @@ class PipelinedChatCompletions:
                 reasoning_text = str(reasoning)
                 reasoning_parts.append(reasoning_text)
                 reasoning_accum += reasoning_text
-                if logger_layer is not None:
-                    logger_layer.logger.log_output_chunk(reasoning_text, is_thinking=True)
-                if loop_layer is not None:
-                    loop_reason = loop_layer.check(reasoning_accum)
+                if logger_pipeline is not None:
+                    logger_pipeline.logger.log_output_chunk(reasoning_text, is_thinking=True)
+                if loop_pipeline is not None:
+                    loop_reason = loop_pipeline.check(reasoning_accum)
                     if loop_reason:
                         loop_scope = "thought"
                         await self._close_stream(stream)
@@ -897,10 +948,10 @@ class PipelinedChatCompletions:
                 content_text = str(content)
                 content_parts.append(content_text)
                 content_accum += content_text
-                if logger_layer is not None:
-                    logger_layer.logger.log_output_chunk(content_text, is_thinking=False)
-                if loop_layer is not None:
-                    loop_reason = loop_layer.check(content_accum)
+                if logger_pipeline is not None:
+                    logger_pipeline.logger.log_output_chunk(content_text, is_thinking=False)
+                if loop_pipeline is not None:
+                    loop_reason = loop_pipeline.check(content_accum)
                     if loop_reason:
                         loop_scope = "message"
                         await self._close_stream(stream)
@@ -919,8 +970,8 @@ class PipelinedChatCompletions:
         tool_calls = self._final_tool_calls(tool_call_parts)
         if tool_calls:
             message["tool_calls"] = tool_calls
-            if logger_layer is not None:
-                logger_layer.logger.log_tool_calls(tool_calls)
+            if logger_pipeline is not None:
+                logger_pipeline.logger.log_tool_calls(tool_calls)
 
         response: dict[str, Any] = {
             "id": response_id or "chatcmpl-stream",
@@ -1013,19 +1064,19 @@ class PipelinedChatCompletions:
             result.append(tool_call)
         return result
 
-    def _normalize_layers(self, layers: Sequence[Any] | None) -> tuple[Any, ...]:
-        if layers is None:
+    def _normalize_pipelines(self, pipelines: Sequence[Any] | None) -> tuple[Any, ...]:
+        if pipelines is None:
             return ()
         normalized: list[Any] = []
-        for layer in layers:
-            if isinstance(layer, str):
-                layer = self._layer_from_name(layer)
-            if not isinstance(layer, (ToolPipeline, LoopGuardPipeline, JsonFixPipeline, LoggerPipeline)):
-                raise TypeError(f"Unsupported pipeline layer: {layer!r}")
-            normalized.append(layer)
+        for pipeline in pipelines:
+            if isinstance(pipeline, str):
+                pipeline = self._pipeline_from_name(pipeline)
+            if not isinstance(pipeline, (ToolPipeline, LoopGuardPipeline, JsonFixPipeline, LoggerPipeline)):
+                raise TypeError(f"Unsupported pipeline: {pipeline!r}")
+            normalized.append(pipeline)
         return tuple(normalized)
 
-    def _layer_from_name(self, name: str) -> Any:
+    def _pipeline_from_name(self, name: str) -> Any:
         key = name.strip().lower()
         if key in {"tool", "tools"}:
             return ToolPipeline()
@@ -1035,12 +1086,12 @@ class PipelinedChatCompletions:
             return JsonFixPipeline()
         if key in {"logger", "logging", "log"}:
             return LoggerPipeline()
-        raise ValueError(f"Unknown pipeline layer: {name!r}")
+        raise ValueError(f"Unknown pipeline: {name!r}")
 
-    def _layer(self, layer_type: type) -> Any | None:
-        for layer in self.layers:
-            if isinstance(layer, layer_type):
-                return layer
+    def _pipeline_of_type(self, pipeline_type: type) -> Any | None:
+        for pipeline in self.pipelines:
+            if isinstance(pipeline, pipeline_type):
+                return pipeline
         return None
 
     async def _resolve_tool_sources(self, tool_sources: Sequence[Any] | Any) -> tuple[list[dict[str, Any]], dict[str, ToolHandler]]:
@@ -1266,25 +1317,26 @@ class PipelinedChatCompletions:
             return obj.get(key, default)
         return getattr(obj, key, default)
 
-    def _log_tool_results(self, logger_layer: LoggerPipeline | None, executions: list[ToolExecution]) -> None:
-        if logger_layer is None or not logger_layer.log_tool_results:
+    def _log_tool_results(self, logger_pipeline: LoggerPipeline | None, executions: list[ToolExecution]) -> None:
+        if logger_pipeline is None or not logger_pipeline.log_tool_results:
             return
         for execution in executions:
-            logger_layer.logger.log_tool_result(execution.name, execution.arguments, execution.result)
+            logger_pipeline.logger.log_tool_result(execution.name, execution.arguments, execution.result)
 
-    def _log_events(self, logger_layer: LoggerPipeline | None, events: list[PipelineEvent]) -> None:
-        if logger_layer is None or not logger_layer.log_events:
+    def _log_events(self, logger_pipeline: LoggerPipeline | None, events: list[PipelineEvent]) -> None:
+        if logger_pipeline is None or not logger_pipeline.log_events:
             return
         for event in events:
-            logger_layer.logger.log_event(event.level, event.action, event.detail)
+            logger_pipeline.logger.log_event(event.level, event.action, event.detail)
 
-    def _log_end(self, logger_layer: LoggerPipeline | None, response: Any) -> None:
-        if logger_layer is None:
+    def _log_end(self, logger_pipeline: LoggerPipeline | None, response: Any) -> None:
+        if logger_pipeline is None:
             return
         usage = _usage(response)
-        logger_layer.logger.log_end(
+        logger_pipeline.logger.log_end(
             prompt_tokens=usage.get("prompt_tokens"),
             completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
             done_reason=_finish_reason(response) or "",
         )
 
@@ -1298,9 +1350,10 @@ class PipelinedChatCompletions:
         return value
 
 
-def with_pipelines(
+def pipelined_chat(
     chat_completions: Any,
     *,
+    pipelines: Sequence[Any] | None = None,
     layers: Sequence[Any] | None = None,
 ) -> PipelinedChatCompletions:
-    return PipelinedChatCompletions(chat_completions, layers=layers)
+    return PipelinedChatCompletions(chat_completions, pipelines=pipelines, layers=layers)

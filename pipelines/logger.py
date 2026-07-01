@@ -1,4 +1,4 @@
-"""Logging layer for OpenAI-compatible pipeline runs."""
+"""Logging pipeline for OpenAI-compatible pipeline runs."""
 from __future__ import annotations
 
 import hashlib
@@ -6,7 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 def _message_code(message: dict[str, Any]) -> str:
@@ -30,7 +30,7 @@ class PipelineLogger:
         self._file = self.path.open("w", encoding="utf-8")
         self._call_num = 0
         self._start = 0.0
-        self._levels: list[str] = []
+        self._context_path: list[str] = []
         self._seen_messages: set[str] = set()
         self._end_written = False
         self._in_thinking = False
@@ -38,23 +38,17 @@ class PipelineLogger:
 
     def set_context(
         self,
-        phase: str = "",
-        step: str = "",
-        sub_phase: str = "",
+        context_path: Sequence[str] | str | None = None,
         attempt: int | None = None,
     ) -> None:
-        if phase:
-            self._levels = [phase]
-        if step:
-            self._levels = self._levels[:1] + [step]
-        if sub_phase:
-            base = 1
-            if len(self._levels) > 1 and self._levels[1].startswith("step:"):
-                base = 2
-            self._levels = self._levels[:base] + [sub_phase]
+        if context_path is not None:
+            if isinstance(context_path, str):
+                self._context_path = [context_path]
+            else:
+                self._context_path = [str(item) for item in context_path]
         if attempt is not None:
-            self._levels = [level for level in self._levels if not level.isdigit()]
-            self._levels.append(str(attempt))
+            self._context_path = [item for item in self._context_path if not item.isdigit()]
+            self._context_path.append(str(attempt))
 
     def log_request(self, body: dict[str, Any], measured_ctx: int | None = None) -> None:
         self._call_num += 1
@@ -125,6 +119,7 @@ class PipelineLogger:
         *,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
+        total_tokens: int | None = None,
         done_reason: str = "",
     ) -> None:
         if self._end_written:
@@ -134,32 +129,33 @@ class PipelineLogger:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         prompt_info = f" [prompt_tokens={prompt_tokens}]" if prompt_tokens else ""
         completion_info = f" [completion_tokens={completion_tokens}]" if completion_tokens else ""
+        total_info = f" [total_tokens={total_tokens}]" if total_tokens else ""
         reason_info = f" [done_reason={done_reason}]" if done_reason else ""
         self._write(
             f"\n{ts} [INFO] pipeline.chat: response_end #{self._call_num} "
-            f"({elapsed:.1f}s){prompt_info}{completion_info}{reason_info}{self._context_tag()}\n"
+            f"({elapsed:.1f}s){prompt_info}{completion_info}{total_info}{reason_info}{self._context_tag()}\n"
         )
         self._file.flush()
 
     def save_state(self) -> dict[str, Any]:
         return {
             "call_num": self._call_num,
-            "levels": list(self._levels),
+            "context_path": list(self._context_path),
             "seen_messages": set(self._seen_messages),
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
         self._call_num = state["call_num"]
-        self._levels = list(state["levels"])
+        self._context_path = list(state["context_path"])
         self._seen_messages |= set(state["seen_messages"])
 
     def close(self) -> None:
         self._file.close()
 
     def _context_tag(self) -> str:
-        if not self._levels:
+        if not self._context_path:
             return ""
-        return f" [{':'.join(self._levels)}]"
+        return f" [{':'.join(self._context_path)}]"
 
     def _write_message(self, message: dict[str, Any]) -> None:
         code = _message_code(message)
@@ -193,7 +189,7 @@ class PipelineLogger:
 
 
 class LoggerPipeline:
-    """Layer object that enables request/response/event logging."""
+    """Pipeline object that enables request/response/event logging."""
 
     def __init__(
         self,

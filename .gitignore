@@ -15,3 +15,6 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# AI
+mcp.json
